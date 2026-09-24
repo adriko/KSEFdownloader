@@ -14,6 +14,11 @@ KATALOG_PROJEKTU = os.path.dirname(os.path.abspath(__file__))
 SKRYPT_KONWERTERA = os.path.join(KATALOG_PROJEKTU, "ksef-pdf-generator", "konwertuj.mjs")
 
 
+class KSeFRateLimitError(Exception):
+    """Zgłaszany, gdy serwer KSeF nałoży długą blokadę czasową (429)."""
+    pass
+
+
 def zaloguj_do_ksef(nip, token):
     nip = str(nip).strip()
     token = str(token).strip()
@@ -103,16 +108,15 @@ def pobierz_faktury_z_okna(access_token, od_kiedy, do_kiedy):
             json=filtry,
         )
 
-        # 🔍 Weryfikacja kodu odpowiedzi serwera KSeF
         if resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 10))
             if retry_after > 60:
                 minuty = max(1, round(retry_after / 60))
                 print(
                     f"\n⚠️ Serwer KSeF nałożył blokadę na {retry_after}s (~{minuty} min). "
-                    f"Spróbuj ponownie za około {minuty} min."
+                    f"Przerywam sprawdzanie metadanych."
                 )
-                break  # Przerywamy dalsze odpytywanie przy długiej blokadzie
+                raise KSeFRateLimitError(f"Blokada KSeF na {minuty} minut.")
             print(f"Limit zapytań KSeF (429). Czekam krótko {retry_after}s...")
             time.sleep(retry_after)
             continue
@@ -131,7 +135,7 @@ def pobierz_faktury_z_okna(access_token, od_kiedy, do_kiedy):
             break
 
         page_offset += 1
-        time.sleep(0.5)
+        time.sleep(1.0)
 
     return wszystkie
 
@@ -182,8 +186,8 @@ def pobierz_tresc_xml(url_faktura, access_token):
             retry_after = int(resp.headers.get("Retry-After", 10))
             if retry_after > 60:
                 minuty = max(1, round(retry_after / 60))
-                print(f"⚠️ Długa blokada pobierania XML (~{minuty} min). Przerywam pobieranie tego pliku.")
-                return None
+                print(f"⚠️ Długa blokada pobierania XML (~{minuty} min). Przerywam pobieranie dla tej firmy.")
+                raise KSeFRateLimitError(f"Blokada KSeF na {minuty} minut.")
             print(f"Przekroczono limit zapytań (429). Czekam {retry_after}s...")
             time.sleep(retry_after)
         else:
@@ -193,8 +197,8 @@ def pobierz_tresc_xml(url_faktura, access_token):
 
 def main(progress_callback=None):
     teraz = datetime.now(timezone.utc)
-    # 🗓️ Ustawiamy datę graniczną na 1 stycznia 2026 r.
-    data_graniczna = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    # ⏱️ Dynamiczne okno: dokładnie 90 dni wstecz od momentu uruchomienia
+    data_graniczna = teraz - timedelta(days=90)
 
     suma_nowych = 0
     suma_pominietych = 0
@@ -225,7 +229,12 @@ def main(progress_callback=None):
 
         try:
             faktury = pobierz_faktury_az_do_daty(access_token, data_graniczna, teraz)
-            print(f"Łącznie pobrano metadanych faktur (od 2026-01-01): {len(faktury)}")
+            print(f"Łącznie pobrano metadanych faktur (ostatnie 90 dni): {len(faktury)}")
+        except KSeFRateLimitError as e:
+            print(f"🛑 Zatrzymano firmę {nazwa_firmy}: {e}")
+            if progress_callback:
+                progress_callback(nazwa_firmy, 0, 1, suma_nowych, suma_pominietych, str(e))
+            continue
         except Exception as e:
             print(f"Błąd pobierania listy faktur dla {nazwa_firmy}: {e}")
             continue
@@ -237,13 +246,26 @@ def main(progress_callback=None):
         if razem == 0 and progress_callback:
             progress_callback(nazwa_firmy, 1, 1, suma_nowych, suma_pominietych, "Brak faktur w wybranym okresie.")
 
-        for i, f in enumerate(faktury, start=1):
-            nr_ksef = f.get("ksefNumber")
-            nazwa_pdf = f"{nr_ksef}.pdf"
-            sciezka_pdf = os.path.join(folder, nazwa_pdf)
+        try:
+            for i, f in enumerate(faktury, start=1):
+                nr_ksef = f.get("ksefNumber")
+                nazwa_pdf = f"{nr_ksef}.pdf"
+                sciezka_pdf = os.path.join(folder, nazwa_pdf)
 
-            if nazwa_pdf in istniejace_pliki:
-                pominiete_w_firmie += 1
+                if nazwa_pdf in istniejace_pliki:
+                    pominiete_w_firmie += 1
+                    if progress_callback:
+                        progress_callback(
+                            nazwa_firmy,
+                            i,
+                            razem,
+                            suma_nowych + nowe_w_firmie,
+                            suma_pominietych + pominiete_w_firmie,
+                            f"Pominięto istniejącą ({i}/{razem})",
+                        )
+                    continue
+
+                status_tekst = f"Pobieranie {i}/{razem}: {nr_ksef[:15]}..."
                 if progress_callback:
                     progress_callback(
                         nazwa_firmy,
@@ -251,11 +273,36 @@ def main(progress_callback=None):
                         razem,
                         suma_nowych + nowe_w_firmie,
                         suma_pominietych + pominiete_w_firmie,
-                        f"Pominięto istniejącą ({i}/{razem})",
+                        status_tekst,
                     )
-                continue
 
-            status_tekst = f"Pobieranie {i}/{razem}: {nr_ksef[:15]}..."
+                print(f"Pobieram i generuję PDF: {nazwa_pdf}...")
+                url_faktura = f"https://api.ksef.mf.gov.pl/v2/invoices/ksef/{nr_ksef}"
+                xml_bytes = pobierz_tresc_xml(url_faktura, access_token)
+
+                if xml_bytes:
+                    try:
+                        konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf)
+                        nowe_w_firmie += 1
+                        istniejace_pliki.add(nazwa_pdf)
+                    except Exception as e:
+                        print(f"Błąd generowania PDF dla {nr_ksef}: {e}")
+
+                if progress_callback:
+                    progress_callback(
+                        nazwa_firmy,
+                        i,
+                        razem,
+                        suma_nowych + nowe_w_firmie,
+                        suma_pominietych + pominiete_w_firmie,
+                        f"Gotowe {i}/{razem}",
+                    )
+
+                # ⏱️ Bezpieczna pauza między pojedynczymi pobraniami plików XML
+                time.sleep(2.0)
+
+        except KSeFRateLimitError as e:
+            print(f"🛑 Zatrzymano pobieranie plików dla {nazwa_firmy}: {e}")
             if progress_callback:
                 progress_callback(
                     nazwa_firmy,
@@ -263,32 +310,8 @@ def main(progress_callback=None):
                     razem,
                     suma_nowych + nowe_w_firmie,
                     suma_pominietych + pominiete_w_firmie,
-                    status_tekst,
+                    f"Zatrzymano: {e}",
                 )
-
-            print(f"Pobieram i generuję PDF: {nazwa_pdf}...")
-            url_faktura = f"https://api.ksef.mf.gov.pl/v2/invoices/ksef/{nr_ksef}"
-            xml_bytes = pobierz_tresc_xml(url_faktura, access_token)
-
-            if xml_bytes:
-                try:
-                    konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf)
-                    nowe_w_firmie += 1
-                    istniejace_pliki.add(nazwa_pdf)
-                except Exception as e:
-                    print(f"Błąd generowania PDF dla {nr_ksef}: {e}")
-
-            if progress_callback:
-                progress_callback(
-                    nazwa_firmy,
-                    i,
-                    razem,
-                    suma_nowych + nowe_w_firmie,
-                    suma_pominietych + pominiete_w_firmie,
-                    f"Gotowe {i}/{razem}",
-                )
-
-            time.sleep(3.8)
 
         suma_nowych += nowe_w_firmie
         suma_pominietych += pominiete_w_firmie
