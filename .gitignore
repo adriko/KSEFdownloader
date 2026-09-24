@@ -1,0 +1,14 @@
+# Klucze i poufne dane firm
+config.py
+
+# Pobrane faktury i pliki tymczasowe
+*.pdf
+*_temp.xml
+
+# Środowisko wirtualne Pythona
+venv/
+__pycache__/
+*.pyc
+
+# Zależności generatora PDF
+node_modules/
