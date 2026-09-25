@@ -1,13 +1,15 @@
 import base64
-from datetime import datetime, timedelta, timezone
 import os
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
+
+import requests
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
-import requests
+
 from config import FIRMY
 
 KATALOG_PROJEKTU = os.path.dirname(os.path.abspath(__file__))
@@ -16,7 +18,6 @@ SKRYPT_KONWERTERA = os.path.join(KATALOG_PROJEKTU, "ksef-pdf-generator", "konwer
 
 class KSeFRateLimitError(Exception):
     """Zgłaszany, gdy serwer KSeF nałoży długą blokadę czasową (429)."""
-    pass
 
 
 def zaloguj_do_ksef(nip, token):
@@ -37,7 +38,7 @@ def zaloguj_do_ksef(nip, token):
         base64.b64decode(cert_info["certificate"]), default_backend()
     )
 
-    tekst = f"{token}|{resp_ch['timestampMs']}".encode("utf-8")
+    tekst = f"{token}|{resp_ch['timestampMs']}".encode()
     zaszyfrowany = cert.public_key().encrypt(
         tekst,
         padding.OAEP(
@@ -174,7 +175,7 @@ def konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf):
         f.write(xml_bytes)
 
     komenda = ["node", SKRYPT_KONWERTERA, sciezka_tmp_xml, sciezka_pdf]
-    wynik = subprocess.run(komenda, capture_output=True, text=True)
+    wynik = subprocess.run(komenda, capture_output=True, text=True, check=False)
 
     if os.path.exists(sciezka_tmp_xml):
         os.remove(sciezka_tmp_xml)
@@ -246,7 +247,7 @@ def main(progress_callback=None, stop_event=None, wybrana_firma_nip="WSZYSTKIE",
         try:
             access_token = zaloguj_do_ksef(nip, token)
             print("Zalogowano pomyślnie do KSeF.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Błąd logowania dla NIP {nip}: {e}")
             continue
 
@@ -277,7 +278,7 @@ def main(progress_callback=None, stop_event=None, wybrana_firma_nip="WSZYSTKIE",
                 if progress_callback:
                     progress_callback(nazwa_firmy, 0, 1, suma_nowych, suma_pominietych, str(e))
                 break
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Błąd listy faktur ({etykieta_grupy}): {e}")
                 continue
 
@@ -342,7 +343,7 @@ def main(progress_callback=None, stop_event=None, wybrana_firma_nip="WSZYSTKIE",
                             try:
                                 konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf)
                                 istniejace_pdf.add(nazwa_pdf)
-                            except Exception as e:
+                            except Exception as e:  # noqa: BLE001
                                 print(f"Błąd generowania PDF dla {nr_ksef}: {e}")
 
                         nowe_w_grupie += 1

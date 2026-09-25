@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import sys
 import threading
+
 import customtkinter as ctk
 from tkcalendar import DateEntry
 
@@ -60,7 +61,7 @@ class AplikacjaKSeF(ctk.CTk):
         self.combo_firma.set("WSZYSTKIE")
 
         # Wiersz 2: Zakres dat (Kalendarze DateEntry)
-        teraz = datetime.now()
+        teraz = datetime.now(timezone.utc)
         data_od_domyslna = teraz - timedelta(days=90)
 
         ctk.CTkLabel(self.ramka_opcji, text="Data od:", font=ctk.CTkFont(weight="bold")).grid(
@@ -264,7 +265,7 @@ class AplikacjaKSeF(ctk.CTk):
         def zadanie():
             try:
                 main.main(progress_callback=callback, stop_event=self.stop_event, **parametry)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"\nWystąpił błąd: {e}")
             finally:
                 def zakoncz():
