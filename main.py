@@ -1,23 +1,73 @@
 import base64
 import os
+import secrets
 import subprocess
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 import requests
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from config import FIRMY
+import zarzadca_ustawien as zu
 
 KATALOG_PROJEKTU = os.path.dirname(os.path.abspath(__file__))
 SKRYPT_KONWERTERA = os.path.join(KATALOG_PROJEKTU, "ksef-pdf-generator", "konwertuj.mjs")
 
 
 class KSeFRateLimitError(Exception):
-    """Zgłaszany, gdy serwer KSeF nałoży długą blokadę czasową (429)."""
+    """Zgłaszany, gdy serwer KSeF nałoży długą blokadę czasową, a operacja zostanie przerwana."""
+
+
+def czekaj_z_odliczaniem(
+    sekundy: int,
+    stop_event=None,
+    progress_callback=None,
+    nazwa_firmy: str = "",
+    status_prefix: str = "⏳ Limit KSeF (429)",
+) -> bool:
+    """Odlicza sekundy nałożone przez serwer KSeF (nagłówek Retry-After)."""
+    laczny_czas = max(sekundy, 1)
+    print(f"\n⚠️ Wykryto limit KSeF! Wstrzymanie pracy na {sekundy} s...")
+
+    for pozostalo in range(laczny_czas, 0, -1):
+        if stop_event and stop_event.is_set():
+            return False
+
+        if progress_callback:
+            uplynelo = laczny_czas - pozostalo
+            progress_callback(
+                nazwa_firmy,
+                uplynelo,
+                laczny_czas,
+                0,
+                0,
+                f"{status_prefix}! Wznowienie za: {pozostalo} s...",
+            )
+
+        time.sleep(1.0)
+
+    print("✅ Limit minął – wznawiam pracę.\n")
+    return True
+
+
+def pobierz_certyfikat_szyfrowania_paczek():
+    """Pobiera klucz publiczny MF do szyfrowania klucza symetrycznego paczki."""
+    url_keys = "https://api.ksef.mf.gov.pl/v2/security/public-key-certificates"
+    resp_keys = requests.get(url_keys, timeout=30).json()
+    cert_info = next(
+        (c for c in resp_keys if "SymmetricKeyEncryption" in c.get("usage", [])),
+        resp_keys[0],
+    )
+    cert = x509.load_der_x509_certificate(
+        base64.b64decode(cert_info["certificate"]), default_backend()
+    )
+    return cert, cert_info["publicKeyId"]
 
 
 def zaloguj_do_ksef(nip, token):
@@ -26,11 +76,11 @@ def zaloguj_do_ksef(nip, token):
 
     url_ch = "https://api.ksef.mf.gov.pl/v2/auth/challenge"
     resp_ch = requests.post(
-        url_ch, json={"contextIdentifier": {"type": "Nip", "value": nip}}
+        url_ch, json={"contextIdentifier": {"type": "Nip", "value": nip}}, timeout=30
     ).json()
 
     url_keys = "https://api.ksef.mf.gov.pl/v2/security/public-key-certificates"
-    resp_keys = requests.get(url_keys).json()
+    resp_keys = requests.get(url_keys, timeout=30).json()
     cert_info = next(
         c for c in resp_keys if "KsefTokenEncryption" in c.get("usage", [])
     )
@@ -57,6 +107,7 @@ def zaloguj_do_ksef(nip, token):
             "encryptedToken": base64.b64encode(zaszyfrowany).decode("utf-8"),
             "publicKeyId": cert_info["publicKeyId"],
         },
+        timeout=30,
     ).json()
 
     ref_number = resp_auth["referenceNumber"]
@@ -68,6 +119,7 @@ def zaloguj_do_ksef(nip, token):
         st = requests.get(
             f"https://api.ksef.mf.gov.pl/v2/auth/{ref_number}",
             headers=headers_auth,
+            timeout=30,
         ).json()
         kod = st.get("status", {}).get("code")
         if kod == 200:
@@ -77,96 +129,171 @@ def zaloguj_do_ksef(nip, token):
         time.sleep(1)
 
     url_redeem = "https://api.ksef.mf.gov.pl/v2/auth/token/redeem"
-    access_token = requests.post(url_redeem, headers=headers_auth).json()[
+    access_token = requests.post(url_redeem, headers=headers_auth, timeout=30).json()[
         "accessToken"
     ]["token"]
     return access_token
 
 
-def pobierz_faktury_z_okna(access_token, od_kiedy, do_kiedy, subject_type="Subject2", stop_event=None):
-    """Pobiera metadane faktur dla pojedynczego przedziału czasowego i typu podmiotu."""
-    wszystkie = []
-    page_offset = 0
-    page_size = 100
+def pobierz_paczke_faktur(
+    access_token,
+    data_od,
+    data_do,
+    subject_type,
+    folder_docelowy_xml,
+    stop_event,
+    progress_callback,
+    nazwa_firmy,
+    prefiks,
+):
+    """Pobiera i odszyfrowuje paczki faktur, dzieląc zakres na okna <= 90 dni (limit KSeF: 100 dni)."""
+    # Dzielimy żądany zakres na okna do 90 dni, aby uniknąć błędu 21405
+    okna_czasowe = []
+    kursor_od = data_od
+    while kursor_od < data_do:
+        kursor_do = min(kursor_od + timedelta(days=90), data_do)
+        okna_czasowe.append((kursor_od, kursor_do))
+        kursor_od = kursor_do
 
-    filtry = {
-        "subjectType": subject_type,
-        "dateRange": {
-            "dateType": "PermanentStorage",
-            "from": od_kiedy.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "to": do_kiedy.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        },
+    cert_mf, key_id = pobierz_certyfikat_szyfrowania_paczek()
+    url_export = "https://api.ksef.mf.gov.pl/v2/invoices/exports"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
     }
 
-    while True:
-        if stop_event and stop_event.is_set():
-            break
+    lacznie_wyodrebnionych = 0
 
-        url_query = f"https://api.ksef.mf.gov.pl/v2/invoices/query/metadata?pageOffset={page_offset}&pageSize={page_size}"
-        resp = requests.post(
-            url_query,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json=filtry,
+    for nr_okna, (okno_od, okno_do) in enumerate(okna_czasowe, start=1):
+        if stop_event and stop_event.is_set():
+            return lacznie_wyodrebnionych
+
+        print(
+            f"Zlecam paczkę [{prefiks}] ({nr_okna}/{len(okna_czasowe)}): "
+            f"{okno_od.strftime('%Y-%m-%d')} do {okno_do.strftime('%Y-%m-%d')}..."
         )
 
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 10))
-            if retry_after > 60:
-                minuty = max(1, round(retry_after / 60))
-                print(
-                    f"\n⚠️ Serwer KSeF nałożył blokadę na {retry_after}s (~{minuty} min). "
-                    f"Przerywam sprawdzanie metadanych."
-                )
-                raise KSeFRateLimitError(f"Blokada KSeF na {minuty} minut.")
-            print(f"Limit zapytań KSeF (429). Czekam krótko {retry_after}s...")
-            time.sleep(retry_after)
+        # 1. Unikalna para kluczy symetrycznych AES dla każdego okna
+        aes_key = secrets.token_bytes(32)
+        iv = secrets.token_bytes(16)
+
+        enc_sym_key = cert_mf.public_key().encrypt(
+            aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+
+        payload = {
+            "encryption": {
+                "encryptedSymmetricKey": base64.b64encode(enc_sym_key).decode("utf-8"),
+                "initializationVector": base64.b64encode(iv).decode("utf-8"),
+                "publicKeyId": key_id,
+            },
+            "filters": {
+                "subjectType": subject_type,
+                "dateRange": {
+                    "dateType": "PermanentStorage",
+                    "from": okno_od.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "to": okno_do.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+            },
+        }
+
+        # 2. Wysłanie zlecenia eksportu
+        while True:
+            if stop_event and stop_event.is_set():
+                return lacznie_wyodrebnionych
+
+            resp = requests.post(url_export, headers=headers, json=payload, timeout=45)
+            if resp.status_code == 429:
+                retry = int(resp.headers.get("Retry-After", 60))
+                if not czekaj_z_odliczaniem(retry, stop_event, progress_callback, nazwa_firmy):
+                    return lacznie_wyodrebnionych
+                continue
+            elif resp.status_code not in (200, 201):
+                print(f"Błąd zlecenia eksportu: {resp.text}")
+                break
+            break
+
+        if resp.status_code not in (200, 201):
             continue
-        elif resp.status_code != 200:
-            print(f"Błąd KSeF ({resp.status_code}): {resp.text}")
-            break
 
-        dane = resp.json()
-        paczka = dane.get("invoices", [])
+        ref_number = resp.json()["referenceNumber"]
+
+        # 3. Oczekiwanie na przygotowanie paczki przez KSeF
+        url_status = f"https://api.ksef.mf.gov.pl/v2/invoices/exports/{ref_number}"
+        paczka = None
+        while True:
+            if stop_event and stop_event.is_set():
+                return lacznie_wyodrebnionych
+
+            r_stat = requests.get(url_status, headers=headers, timeout=30)
+            if r_stat.status_code == 429:
+                retry = int(r_stat.headers.get("Retry-After", 10))
+                if not czekaj_z_odliczaniem(retry, stop_event, progress_callback, nazwa_firmy):
+                    return lacznie_wyodrebnionych
+                continue
+
+            if r_stat.status_code == 200:
+                dane_statusu = r_stat.json()
+                kod = dane_statusu.get("status", {}).get("code")
+                if kod == 200:
+                    paczka = dane_statusu.get("package", {})
+                    break
+                elif kod not in (100, 150):
+                    print(f"Błąd generowania paczki: {dane_statusu}")
+                    break
+
+            if progress_callback:
+                progress_callback(
+                    nazwa_firmy,
+                    nr_okna - 1,
+                    len(okna_czasowe),
+                    lacznie_wyodrebnionych,
+                    0,
+                    f"⏳ KSeF generuje paczkę ({nr_okna}/{len(okna_czasowe)}) [{prefiks}]...",
+                )
+            time.sleep(3.0)
+
         if not paczka:
-            break
+            continue
 
-        wszystkie.extend(paczka)
+        # 4. Odszyfrowanie i rozpakowanie plików XML
+        czesci = paczka.get("parts", [])
+        for czesc in czesci:
+            if stop_event and stop_event.is_set():
+                return lacznie_wyodrebnionych
 
-        if len(paczka) < page_size:
-            break
+            r_plik = requests.get(czesc["url"], timeout=120)
+            zaszyfrowane = r_plik.content
 
-        page_offset += 1
+            cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+            decryptor = cipher.decryptor()
+            odszyfrowany_padded = decryptor.update(zaszyfrowane) + decryptor.finalize()
+
+            unpadder = sym_padding.PKCS7(128).unpadder()
+            dane_zip = unpadder.update(odszyfrowany_padded) + unpadder.finalize()
+
+            sciezka_zip = os.path.join(folder_docelowy_xml, f"temp_{ref_number}.zip")
+            with open(sciezka_zip, "wb") as f_zip:
+                f_zip.write(dane_zip)
+
+            with zipfile.ZipFile(sciezka_zip, "r") as zf:
+                for nazwa_pliku in zf.namelist():
+                    if nazwa_pliku.endswith(".xml"):
+                        zf.extract(nazwa_pliku, folder_docelowy_xml)
+                        lacznie_wyodrebnionych += 1
+
+            if os.path.exists(sciezka_zip):
+                os.remove(sciezka_zip)
+
         time.sleep(1.0)
 
-    return wszystkie
-
-
-def pobierz_faktury_az_do_daty(access_token, data_od, data_do, subject_type="Subject2", stop_event=None):
-    """Pobiera metadane cofając się o 90-dniowe okna od data_do aż do data_od."""
-    unikalne_faktury = {}
-    okno_koniec = data_do
-
-    while okno_koniec > data_od:
-        if stop_event and stop_event.is_set():
-            break
-
-        okno_poczatek = max(okno_koniec - timedelta(days=90), data_od)
-        nazwa_typu = "ZAKUPOWE" if subject_type == "Subject2" else "SPRZEDAŻOWE"
-        print(f"Sprawdzam zakres ({nazwa_typu}): od {okno_poczatek.strftime('%Y-%m-%d')} do {okno_koniec.strftime('%Y-%m-%d')}...")
-
-        paczka = pobierz_faktury_z_okna(access_token, okno_poczatek, okno_koniec, subject_type, stop_event)
-        for f in paczka:
-            unikalne_faktury[f["ksefNumber"]] = f
-
-        okno_koniec = okno_poczatek
-        time.sleep(1.0)
-
-    lista_faktur = list(unikalne_faktury.values())
-    lista_faktur.reverse()
-    return lista_faktur
+    print(f"Łącznie wyodrębniono {lacznie_wyodrebnionych} faktur XML dla [{prefiks}].")
+    return lacznie_wyodrebnionych
 
 
 def konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf):
@@ -184,46 +311,92 @@ def konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf):
         raise RuntimeError(f"Błąd konwersji Node: {wynik.stderr.strip()}")
 
 
-def pobierz_tresc_xml(url_faktura, access_token):
-    headers = {"Authorization": f"Bearer {access_token}"}
-    while True:
-        resp = requests.get(url_faktura, headers=headers)
-        if resp.status_code == 200:
-            return resp.content
-        elif resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 10))
-            if retry_after > 60:
-                minuty = max(1, round(retry_after / 60))
-                print(f"⚠️ Długa blokada pobierania XML (~{minuty} min). Przerywam pobieranie dla tej firmy.")
-                raise KSeFRateLimitError(f"Blokada KSeF na {minuty} minut.")
-            print(f"Przekroczono limit zapytań (429). Czekam {retry_after}s...")
-            time.sleep(retry_after)
-        else:
-            print(f"Błąd pobierania XML ({resp.status_code}): {resp.text}")
-            return None
+def konwertuj_brakujace_pdf(
+    folder_xml,
+    folder_pdf,
+    stop_event,
+    progress_callback,
+    nazwa_firmy,
+    prefiks,
+):
+    """Sprawdza pliki XML i generuje brakujące PDF-y."""
+    os.makedirs(folder_pdf, exist_ok=True)
+    istniejace_pdf = set(os.listdir(folder_pdf)) if os.path.exists(folder_pdf) else set()
+    pliki_xml = [p for p in os.listdir(folder_xml) if p.endswith(".xml")]
+
+    do_konwersji = [p for p in pliki_xml if p.replace(".xml", ".pdf") not in istniejace_pdf]
+    razem = len(do_konwersji)
+    nowe_pdf = 0
+
+    if razem == 0:
+        return 0
+
+    for i, plik_xml in enumerate(do_konwersji, start=1):
+        if stop_event and stop_event.is_set():
+            break
+
+        nazwa_podstawowa = plik_xml.replace(".xml", "")
+        if progress_callback:
+            progress_callback(
+                nazwa_firmy,
+                i,
+                razem,
+                nowe_pdf,
+                0,
+                f"📄 Generowanie PDF ({prefiks}) {i}/{razem}: {nazwa_podstawowa[:15]}...",
+            )
+
+        sciezka_xml = os.path.join(folder_xml, plik_xml)
+        sciezka_pdf = os.path.join(folder_pdf, f"{nazwa_podstawowa}.pdf")
+
+        try:
+            with open(sciezka_xml, "rb") as f_xml:
+                xml_bytes = f_xml.read()
+            konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf)
+            nowe_pdf += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"Błąd generowania PDF dla {nazwa_podstawowa}: {e}")
+
+    return nowe_pdf
 
 
-def main(progress_callback=None, stop_event=None, wybrana_firma_nip="WSZYSTKIE", data_od=None, data_do=None,
-         pobieraj_zakupowe=True, pobieraj_sprzedazowe=False, zapisz_xml=False, zapisz_pdf=True):
+def main(
+    progress_callback=None,
+    stop_event=None,
+    wybrana_firma_nip="WSZYSTKIE",
+    data_od=None,
+    data_do=None,
+    pobieraj_zakupowe=True,
+    pobieraj_sprzedazowe=False,
+    zapisz_xml=True,
+    zapisz_pdf=True,
+    konfiguracja=None,
+):
     teraz = datetime.now(timezone.utc)
     if data_do is None:
         data_do = teraz
     if data_od is None:
         data_od = data_do - timedelta(days=90)
 
+    if konfiguracja is None:
+        konfiguracja = zu.wczytaj_konfiguracje()
+
+    folder_glowny = konfiguracja.get("folder_glowny", zu.pobierz_domyslny_katalog())
+    lista_firm = konfiguracja.get("firmy", [])
+
     if wybrana_firma_nip == "WSZYSTKIE":
-        firmy_do_przetworzenia = FIRMY
+        firmy_do_przetworzenia = lista_firm
     else:
-        firmy_do_przetworzenia = [f for f in FIRMY if str(f["nip"]).strip() == str(wybrana_firma_nip).strip()]
+        firmy_do_przetworzenia = [
+            f for f in lista_firm if str(f["nip"]).strip() == str(wybrana_firma_nip).strip()
+        ]
 
-    zadania_typów = []
+    zadania = []
     if pobieraj_zakupowe:
-        zadania_typów.append(("Subject2", "zakup"))
+        zadania.append(("Subject2", "zakup"))
     if pobieraj_sprzedazowe:
-        zadania_typów.append(("Subject1", "sprzedaz"))
+        zadania.append(("Subject1", "sprzedaz"))
 
-    suma_nowych = 0
-    suma_pominietych = 0
     przerwano = False
 
     for firma in firmy_do_przetworzenia:
@@ -231,18 +404,16 @@ def main(progress_callback=None, stop_event=None, wybrana_firma_nip="WSZYSTKIE",
             przerwano = True
             break
 
-        nazwa_firmy = firma["nazwa"]
+        nazwa = firma["nazwa"]
         nip = str(firma["nip"]).strip()
         token = str(firma["token"]).strip()
-        glowny_folder = firma["folder"]
 
         print("\n==================================================")
-        print(f"Przetwarzam: {nazwa_firmy} (NIP: {nip})")
-        print(f"Katalog bazowy: {glowny_folder}")
+        print(f"Przetwarzam: {nazwa} (NIP: {nip})")
         print("==================================================")
 
         if progress_callback:
-            progress_callback(nazwa_firmy, 0, 1, suma_nowych, suma_pominietych, "Logowanie do KSeF...")
+            progress_callback(nazwa, 0, 1, 0, 0, "Logowanie do KSeF...")
 
         try:
             access_token = zaloguj_do_ksef(nip, token)
@@ -251,143 +422,53 @@ def main(progress_callback=None, stop_event=None, wybrana_firma_nip="WSZYSTKIE",
             print(f"Błąd logowania dla NIP {nip}: {e}")
             continue
 
-        for subject_type, prefiks in zadania_typów:
+        for subject_type, prefiks in zadania:
             if stop_event and stop_event.is_set():
                 przerwano = True
                 break
 
-            etykieta_grupy = "ZAKUPOWE" if prefiks == "zakup" else "SPRZEDAŻOWE"
-            print(f"\n--- Pobieranie faktur: {etykieta_grupy} ---")
+            folder_xml = zu.pobierz_sciezke_firmy(folder_glowny, nip, f"{prefiks}_xml")
+            folder_pdf = zu.pobierz_sciezke_firmy(folder_glowny, nip, f"{prefiks}_pdf")
+            os.makedirs(folder_xml, exist_ok=True)
+            os.makedirs(folder_pdf, exist_ok=True)
 
-            folder_pdf = os.path.join(glowny_folder, f"{prefiks}_pdf")
-            folder_xml = os.path.join(glowny_folder, f"{prefiks}_xml")
+            print(f"\n--- Rozpoczynam pobieranie paczki: {prefiks.upper()} ---")
+            pobierz_paczke_faktur(
+                access_token=access_token,
+                data_od=data_od,
+                data_do=data_do,
+                subject_type=subject_type,
+                folder_docelowy_xml=folder_xml,
+                stop_event=stop_event,
+                progress_callback=progress_callback,
+                nazwa_firmy=nazwa,
+                prefiks=prefiks,
+            )
 
             if zapisz_pdf:
-                os.makedirs(folder_pdf, exist_ok=True)
-            if zapisz_xml:
-                os.makedirs(folder_xml, exist_ok=True)
+                print(f"Generowanie brakujących plików PDF dla [{prefiks}]...")
+                konwertuj_brakujace_pdf(
+                    folder_xml=folder_xml,
+                    folder_pdf=folder_pdf,
+                    stop_event=stop_event,
+                    progress_callback=progress_callback,
+                    nazwa_firmy=nazwa,
+                    prefiks=prefiks,
+                )
 
-            istniejace_pdf = set(os.listdir(folder_pdf)) if os.path.exists(folder_pdf) else set()
-            istniejace_xml = set(os.listdir(folder_xml)) if os.path.exists(folder_xml) else set()
-
-            try:
-                faktury = pobierz_faktury_az_do_daty(access_token, data_od, data_do, subject_type=subject_type, stop_event=stop_event)
-                print(f"Znaleziono metadanych ({etykieta_grupy}): {len(faktury)}")
-            except KSeFRateLimitError as e:
-                print(f"🛑 Zatrzymano firmę {nazwa_firmy}: {e}")
-                if progress_callback:
-                    progress_callback(nazwa_firmy, 0, 1, suma_nowych, suma_pominietych, str(e))
-                break
-            except Exception as e:  # noqa: BLE001
-                print(f"Błąd listy faktur ({etykieta_grupy}): {e}")
-                continue
-
-            razem = len(faktury)
-            nowe_w_grupie = 0
-            pominiete_w_grupie = 0
-
-            if razem == 0 and progress_callback:
-                progress_callback(nazwa_firmy, 1, 1, suma_nowych, suma_pominietych, f"Brak faktur ({etykieta_grupy}).")
-
-            try:
-                for i, f in enumerate(faktury, start=1):
-                    if stop_event and stop_event.is_set():
-                        przerwano = True
-                        break
-
-                    nr_ksef = f.get("ksefNumber")
-                    nazwa_pdf = f"{nr_ksef}.pdf"
-                    nazwa_xml = f"{nr_ksef}.xml"
-
-                    sciezka_pdf = os.path.join(folder_pdf, nazwa_pdf)
-                    sciezka_xml = os.path.join(folder_xml, nazwa_xml)
-
-                    pdf_istnieje = (not zapisz_pdf) or (nazwa_pdf in istniejace_pdf)
-                    xml_istnieje = (not zapisz_xml) or (nazwa_xml in istniejace_xml)
-
-                    if pdf_istnieje and xml_istnieje:
-                        pominiete_w_grupie += 1
-                        if progress_callback:
-                            progress_callback(
-                                nazwa_firmy,
-                                i,
-                                razem,
-                                suma_nowych + nowe_w_grupie,
-                                suma_pominietych + pominiete_w_grupie,
-                                f"Pominięto [{etykieta_grupy}] ({i}/{razem})",
-                            )
-                        continue
-
-                    status_tekst = f"[{etykieta_grupy}] {i}/{razem}: {nr_ksef[:15]}..."
-                    if progress_callback:
-                        progress_callback(
-                            nazwa_firmy,
-                            i,
-                            razem,
-                            suma_nowych + nowe_w_grupie,
-                            suma_pominietych + pominiete_w_grupie,
-                            status_tekst,
-                        )
-
-                    print(f"Pobieram [{etykieta_grupy}]: {nr_ksef}...")
-                    url_faktura = f"https://api.ksef.mf.gov.pl/v2/invoices/ksef/{nr_ksef}"
-                    xml_bytes = pobierz_tresc_xml(url_faktura, access_token)
-
-                    if xml_bytes:
-                        if zapisz_xml:
-                            with open(sciezka_xml, "wb") as f_xml:
-                                f_xml.write(xml_bytes)
-                            istniejace_xml.add(nazwa_xml)
-
-                        if zapisz_pdf:
-                            try:
-                                konwertuj_xml_na_pdf_node(xml_bytes, sciezka_pdf)
-                                istniejace_pdf.add(nazwa_pdf)
-                            except Exception as e:  # noqa: BLE001
-                                print(f"Błąd generowania PDF dla {nr_ksef}: {e}")
-
-                        nowe_w_grupie += 1
-
-                    if progress_callback:
-                        progress_callback(
-                            nazwa_firmy,
-                            i,
-                            razem,
-                            suma_nowych + nowe_w_grupie,
-                            suma_pominietych + pominiete_w_grupie,
-                            f"Gotowe [{etykieta_grupy}] {i}/{razem}",
-                        )
-
-                    time.sleep(2.0)
-
-            except KSeFRateLimitError as e:
-                print(f"🛑 Zatrzymano pobieranie plików dla {nazwa_firmy}: {e}")
-                if progress_callback:
-                    progress_callback(
-                        nazwa_firmy,
-                        i,
-                        razem,
-                        suma_nowych + nowe_w_grupie,
-                        suma_pominietych + pominiete_w_grupie,
-                        f"Zatrzymano: {e}",
-                    )
-                break
-
-            suma_nowych += nowe_w_grupie
-            suma_pominietych += pominiete_w_grupie
-            print(f"Koniec ({etykieta_grupy}): Nowych: {nowe_w_grupie}, Pominiętych: {pominiete_w_grupie}")
-
-            if przerwano:
-                break
+            time.sleep(2.0)
 
         if przerwano:
             break
 
     if progress_callback:
-        status_koncowy = "🛑 Przerwano operację na żądanie!" if przerwano else "Zakończono pobieranie!"
-        progress_callback("Zakończono" if not przerwano else "Przerwano", 1, 1, suma_nowych, suma_pominietych, status_koncowy)
+        status_koncowy = (
+            "🛑 Przerwano operację na żądanie!" if przerwano else "✅ Zakończono pobieranie!"
+        )
+        progress_callback("Zakończono" if not przerwano else "Przerwano", 1, 1, 0, 0, status_koncowy)
+
     if przerwano:
-        print("\n🛑 Operacja została pomyślnie przerwana na żądanie użytkownika.")
+        print("\n🛑 Operacja została pomyślnie przerwana.")
 
 
 if __name__ == "__main__":

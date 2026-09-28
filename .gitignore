@@ -1,5 +1,6 @@
 # Klucze i poufne dane firm
 config.py
+ustawienia.json
 
 # Pobrane faktury i pliki tymczasowe
 *.pdf

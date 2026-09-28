@@ -1,7 +1,7 @@
 import os
 import re
-from typing import Any
 import xml.etree.ElementTree as ET
+from typing import Any
 
 
 def _wyczysc_namespace(korzen: ET.Element) -> None:
