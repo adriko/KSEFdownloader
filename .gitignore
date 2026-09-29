@@ -1,9 +1,16 @@
-# Klucze i poufne dane firm
+# Klucze, konfiguracje i poufne dane firm
 config.py
 ustawienia.json
+indeks_faktur.json
+
+# Pliki po kompilacji PyInstallera
+build/
+dist/
+*.spec
 
 # Pobrane faktury i pliki tymczasowe
 *.pdf
+*.xml
 *_temp.xml
 
 # Środowisko wirtualne Pythona

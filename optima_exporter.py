@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 import xml.etree.ElementTree as ET
 from typing import Any
 
@@ -11,52 +12,113 @@ def _wyczysc_namespace(korzen: ET.Element) -> None:
             el.tag = el.tag.split("}", 1)[1]
 
 
+def transliteruj_polskie_znaki(tekst: str) -> str:
+    """Zamienia polskie znaki diakrytyczne na ich łacińskie odpowiedniki."""
+    zamiany = {
+        'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z',
+        'Ą': 'A', 'Ć': 'C', 'Ę': 'E', 'Ł': 'L', 'Ń': 'N', 'Ó': 'O', 'Ś': 'S', 'Ź': 'Z', 'Ż': 'Z'
+    }
+    return "".join(zamiany.get(c, c) for c in tekst)
+
+
+def oczysc_nazwe_firmy(nazwa: str) -> str:
+    """Dokładnie oczyszcza nazwę firmy z adresów, numerów BDO, kont bankowych i dopisków oddziałów."""
+    if not nazwa:
+        return ""
+    
+    # Zamiana znaków nowej linii na spacje i normalizacja odstępów
+    nazwa_jednoline = re.sub(r"\s+", " ", nazwa.replace("\n", " ")).strip()
+    
+    # Odcięcie tekstu od momentu wystąpienia słów kluczowych oznaczających dane adresowe lub dodatkowe
+    czysta = re.split(
+        r"(?:Numer\s+konta|BDO\s*[:\s]|Oddział\s+[\w\s-]+,\s*u[l\.]|\bSIEDZIBA\b|\bul\.\b|\bulica\b|\bal\.\b|\baleja\b|\bpl\.\b|\bplac\b|\bos\.\b|\bPark\b|\bOkręgowa\s+Stacja\b)",
+        nazwa_jednoline,
+        flags=re.IGNORECASE
+    )[0]
+    
+    # Usunięcie kodu pocztowego lub nagłówków ulic, jeśli wkleiły się do nazwy
+    czysta = re.sub(r'\b\d{2}-\d{3}\b.*', '', czysta)
+    czysta = re.sub(r'\b(?:ul\.|ulica)\b.*', '', czysta, flags=re.IGNORECASE)
+    
+    # Usuwanie nadmiarowych cudzysłowów, apostrofów oraz znaków interpunkcyjnych na końcach
+    czysta = re.sub(r"^['\"]+|['\"]+$", "", czysta).strip()
+    czysta = re.sub(r"[,;\s-]+$", "", czysta).strip()
+    
+    return czysta if czysta else nazwa_jednoline
+
+
 def oczysc_adres(adres_l1: str, adres_l2: str = "") -> dict[str, str]:
-    """
-    Czyści i rozdziela sklejony adres z KSeF na: ulicę, kod pocztowy i miasto.
-    Usuwa zbędne dopiski administracyjne (województwo, gmina, powiat).
-    """
+    """Poprawione czyszczenie, rozdzielanie adresu oraz wyłuskiwanie numerów BDO."""
     caly_tekst = f"{adres_l1} {adres_l2}".strip()
+    
+    # Wyłuskanie numeru BDO z pól adresowych, jeśli występuje
+    bdo = ""
+    m_bdo = re.search(r'BDO[:\s]*(\d+)', caly_tekst, flags=re.IGNORECASE)
+    if m_bdo:
+        bdo = m_bdo.group(1)
+        caly_tekst = re.sub(r'BDO[:\s]*\d+', '', caly_tekst, flags=re.IGNORECASE).strip()
 
     kod_pocztowy = ""
     miasto = ""
-    ulica = adres_l1.strip()
+    ulica = ""
 
-    m_kod = re.search(r"\b(\d{2}-\d{3})\b", caly_tekst)
-    if m_kod:
-        kod_pocztowy = m_kod.group(1)
+    # Obsługa formatu, gdy kod pocztowy znajduje się na początku ciągu (np. Inter Cars)
+    m_kod_poczatek = re.match(r"^(\d{2}-\d{3})\s+([^,]+),\s*(.*)$", caly_tekst)
+    if m_kod_poczatek:
+        kod_pocztowy = m_kod_poczatek.group(1)
+        miasto = m_kod_poczatek.group(2).strip()
+        ulica = m_kod_poczatek.group(3).strip()
+    else:
+        # Standardowe szukanie kodu pocztowego w tekście
+        m_kod = re.search(r"\b(\d{2}-\d{3})\b", caly_tekst)
+        if m_kod:
+            kod_pocztowy = m_kod.group(1)
+            indeks_kodu = caly_tekst.find(kod_pocztowy)
+            
+            potencjalna_ulica = caly_tekst[:indeks_kodu].strip().rstrip(",")
+            if potencjalna_ulica:
+                ulica = potencjalna_ulica
+                
+            tekst_po_kodzie = caly_tekst[indeks_kodu + len(kod_pocztowy):].strip().lstrip(" ,")
+            m_miasto = re.match(r"^([^,;]+)", tekst_po_kodzie)
+            if m_miasto:
+                miasto = m_miasto.group(1).strip()
+        else:
+            ulica = re.sub(r"^.*?(?:ul\.|u[l\.]|Siedziba:)\s*", "", adres_l1, flags=re.IGNORECASE).strip()
+            miasto = adres_l2.strip() or "Brak"
 
-        tekst_po_kodzie = caly_tekst[m_kod.end():].strip()
-        m_miasto = re.match(r"^([^,;]+)", tekst_po_kodzie)
-        if m_miasto:
-            miasto = m_miasto.group(1).strip()
+    if not ulica and adres_l2:
+        ulica = adres_l2
+    elif not ulica:
+        ulica = re.sub(r"^.*?(?:ul\.|u[l\.]|Siedziba:)\s*", "", adres_l1, flags=re.IGNORECASE).strip()
 
-        if kod_pocztowy in ulica:
-            ulica = ulica.split(kod_pocztowy)[0].strip().rstrip(",")
-            if not ulica:
-                reszta = adres_l1.split(miasto, 1)[-1].strip().lstrip(", ")
-                if reszta:
-                    ulica = reszta
+    # Korekta specyficznych przypadków z pomyloną kolejnością (np. SUDER)
+    if (
+        not miasto
+        or miasto.startswith("M.")
+        or "KRAKÓW" in ulica.upper()
+    ) and "KRAKÓW" in ulica.upper() and not miasto:
+        miasto = "Kraków"
+        ulica = re.sub(r"KRAKÓW\s*", "", ulica, flags=re.IGNORECASE).strip(" ,")
 
-    if not miasto:
-        miasto = adres_l2.strip() or "Brak"
+    # Usunięcie dopisków marketingowych oraz doklejonych nazw ulic (np. ul., al., pl. i ich wariantów) z pól miejscowości
+    miasto = re.sub(r"\s+Sklep\s+Internetowy.*", "", miasto, flags=re.IGNORECASE).strip()
+    miasto = re.sub(r"[\s,]+(?:ul\.?|ulica|al\.?|aleja|pl\.?|plac|os\.?|osiedle)\b.*", "", miasto, flags=re.IGNORECASE).strip()
 
+    ulica = re.sub(r"\b(\d+)\s+\1\b", r"\1", ulica)
     ulica = re.sub(r",\s*$", "", ulica).strip()
     miasto = re.sub(r",\s*$", "", miasto).strip()
 
     return {
-        "ulica": ulica,
+        "ulica": ulica or adres_l1,
         "kod_pocztowy": kod_pocztowy,
-        "miasto": miasto,
+        "miasto": miasto or "Brak",
+        "bdo": bdo,
     }
 
 
 def parsuj_fakture_ksef(sciezka_xml: str, typ_rejestru: str = "sprzedaz") -> dict[str, Any]:
-    """
-    Parsuje fakturę KSeF.
-    Dla sprzedaży (sprzedaz): kontrahentem jest nabywca (Podmiot2).
-    Dla zakupu (zakup): kontrahentem jest dostawca (Podmiot1).
-    """
+    """Parsuje fakturę KSeF dla Optimy."""
     drzewo = ET.parse(sciezka_xml)
     korzen = drzewo.getroot()
     _wyczysc_namespace(korzen)
@@ -66,7 +128,9 @@ def parsuj_fakture_ksef(sciezka_xml: str, typ_rejestru: str = "sprzedaz") -> dic
     adres = wezel_kontrahenta.find("Adres") if wezel_kontrahenta is not None else None
 
     kod_kraju = adres.findtext("KodKraju", default="PL") if adres is not None else "PL"
-    nazwa = dane_id.findtext("Nazwa", default="") if dane_id is not None else ""
+    surowa_nazwa = dane_id.findtext("Nazwa", default="") if dane_id is not None else ""
+    
+    nazwa = oczysc_nazwe_firmy(surowa_nazwa)
 
     if kod_kraju.upper() == "PL":
         nip = dane_id.findtext("NIP", default="") if dane_id is not None else ""
@@ -79,10 +143,14 @@ def parsuj_fakture_ksef(sciezka_xml: str, typ_rejestru: str = "sprzedaz") -> dic
             else ""
         )
 
-    if nip:
+    nazwa_trans = transliteruj_polskie_znaki(nazwa)
+    czysta_nazwa = re.sub(r"[^A-Za-z0-9]", "", nazwa_trans.split()[0]) if nazwa_trans and nazwa_trans.split() else ""
+    if len(czysta_nazwa) >= 3:
+        akronim = czysta_nazwa.upper()[:20]
+    elif nip:
         akronim = f"{kod_kraju}{nip}"
     else:
-        akronim = re.sub(r"[^A-Za-z0-9]", "", nazwa)[:20]
+        akronim = re.sub(r"[^A-Za-z0-9]", "", nazwa_trans)[:20].upper() or "KONTRAHENT"
 
     adres_l1 = adres.findtext("AdresL1", default="") if adres is not None else ""
     adres_l2 = adres.findtext("AdresL2", default="") if adres is not None else ""
@@ -95,11 +163,14 @@ def parsuj_fakture_ksef(sciezka_xml: str, typ_rejestru: str = "sprzedaz") -> dic
     fa = korzen.find("Fa")
     numer = fa.findtext("P_2", default="")
     data_wystawienia = fa.findtext("P_1", default="")
-    data_sprzedazy = fa.findtext("P_6", default=data_wystawienia)
-    termin = (
+    data_sprzedazy = fa.findtext("P_6", default=data_wystawienia) or data_wystawienia
+    
+    surowy_termin = (
         fa.findtext("Platnosc/TerminPlatnosci/Termin", default="")
-        or fa.findtext("Platnosc/DataZaplaty", default=data_wystawienia)
+        or fa.findtext("Platnosc/DataZaplaty", default="")
     )
+    termin = surowy_termin if surowy_termin and len(surowy_termin) >= 10 else data_wystawienia
+
     waluta = fa.findtext("KodWaluty", default="PLN")
     deklaracja_vat7 = data_wystawienia[:7] if len(data_wystawienia) >= 7 else ""
     rodzaj_faktury = fa.findtext("RodzajFaktury", default="VAT")
@@ -189,7 +260,6 @@ def parsuj_fakture_ksef(sciezka_xml: str, typ_rejestru: str = "sprzedaz") -> dic
 
 
 def generuj_xml_optima(lista_danych: list[dict[str, Any]], plik_wyjsciowy: str, typ_rejestru: str = "sprzedaz") -> None:
-    """Generuje plik XML dla Comarch Optima offline (rejestr sprzedaży lub zakupu)."""
     root = ET.Element("ROOT", attrib={"xmlns": "http://www.comarch.pl/cdn/optima/offline"})
 
     kontrahenci_el = ET.SubElement(root, "KONTRAHENCI")
@@ -200,23 +270,38 @@ def generuj_xml_optima(lista_danych: list[dict[str, Any]], plik_wyjsciowy: str, 
     unikalni = {elem["kontrahent"]["akronim"]: elem["kontrahent"] for elem in lista_danych}
     for k in unikalni.values():
         k_el = ET.SubElement(kontrahenci_el, "KONTRAHENT")
+        guid_kontrahenta = f"{{{str(uuid.uuid4()).upper()}}}"
+        ET.SubElement(k_el, "ID_ZRODLA").text = guid_kontrahenta
         ET.SubElement(k_el, "AKRONIM").text = k["akronim"]
+        ET.SubElement(k_el, "ZEZWOLENIE")
+        ET.SubElement(k_el, "OPIS")
+        ET.SubElement(k_el, "CHRONIONY").text = "Nie"
         ET.SubElement(k_el, "RODZAJ").text = "odbiorca dostawca"
         ET.SubElement(k_el, "EKSPORT").text = "krajowy" if k["kod_kraju"] == "PL" else "wewnątrzunijny"
+        ET.SubElement(k_el, "FINALNY").text = "Nie"
         ET.SubElement(k_el, "PLATNIK_VAT").text = "Tak"
+        ET.SubElement(k_el, "MEDIALNY").text = "Nie"
+        ET.SubElement(k_el, "NIEAKTYWNY").text = "Nie"
+        ET.SubElement(k_el, "ROLNIK").text = "Nie"
         ET.SubElement(k_el, "FORMA_PLATNOSCI").text = "przelew"
+        ET.SubElement(k_el, "KOD_TRANSAKCJI").text = "11"
+        ET.SubElement(k_el, "BLOKADA_DOKUMENTOW").text = "Nie"
         ET.SubElement(k_el, "KRAJ_ISO").text = k["kod_kraju"]
+        ET.SubElement(k_el, "LIMIT_PRZETERMINOWANY").text = "Nie"
 
         adresy = ET.SubElement(k_el, "ADRESY")
         adres = ET.SubElement(adresy, "ADRES")
         ET.SubElement(adres, "STATUS").text = "aktualny"
         ET.SubElement(adres, "NAZWA1").text = k["nazwa"]
         ET.SubElement(adres, "KRAJ").text = k["kod_kraju"]
+        ET.SubElement(adres, "WOJEWODZTWO")
+        ET.SubElement(adres, "GMINA")
         ET.SubElement(adres, "ULICA").text = k["ulica"]
         ET.SubElement(adres, "KOD_POCZTOWY").text = k["kod_pocztowy"]
         ET.SubElement(adres, "POCZTA").text = k["poczta"]
         ET.SubElement(adres, "NIP_KRAJ").text = k["kod_kraju"]
         ET.SubElement(adres, "NIP").text = k["nip"]
+        ET.SubElement(adres, "REGON")
 
     tag_zbiorczy = "REJESTRY_ZAKUPU_VAT" if typ_rejestru == "zakup" else "REJESTRY_SPRZEDAZY_VAT"
     tag_elementu = "REJESTR_ZAKUPU_VAT" if typ_rejestru == "zakup" else "REJESTR_SPRZEDAZY_VAT"
@@ -232,15 +317,35 @@ def generuj_xml_optima(lista_danych: list[dict[str, Any]], plik_wyjsciowy: str, 
         r = elem["rejestr"]
 
         rej = ET.SubElement(rejestry_el, tag_elementu)
+        guid_rejestru = f"{{{str(uuid.uuid4()).upper()}}}"
+        ET.SubElement(rej, "ID_ZRODLA").text = guid_rejestru
         ET.SubElement(rej, "MODUL").text = "Rejestr Vat"
         ET.SubElement(rej, "REJESTR").text = "KRAJOWY" if r["is_krajowy"] else "ZAGRANICZNY"
-        ET.SubElement(rej, "DATA_WYSTAWIENIA").text = r["data_wystawienia"]
-        ET.SubElement(rej, "DATA_SPRZEDAZY").text = r["data_sprzedazy"]
-        ET.SubElement(rej, "TERMIN").text = r["termin"]
+        
+        data_wyst = r["data_wystawienia"] if r["data_wystawienia"] else "2026-09-01"
+        data_sprz = r["data_sprzedazy"] if r["data_sprzedazy"] else data_wyst
+        termin_plat = r["termin"] if r["termin"] else data_wyst
+
+        ET.SubElement(rej, "DATA_WYSTAWIENIA").text = data_wyst
+        ET.SubElement(rej, "DATA_SPRZEDAZY").text = data_sprz
+        
+        if typ_rejestru == "zakup":
+            ET.SubElement(rej, "DATA_WPLYWU").text = data_wyst
+            ET.SubElement(rej, "DATA_VAT").text = data_wyst
+
+        ET.SubElement(rej, "TERMIN").text = termin_plat
         ET.SubElement(rej, "NUMER").text = r["numer"]
         ET.SubElement(rej, "KOREKTA").text = r["korekta"]
+        ET.SubElement(rej, "KOREKTA_NUMER")
+        ET.SubElement(rej, "WEWNETRZNA").text = "Nie"
+        ET.SubElement(rej, "FISKALNA").text = "Nie"
+        ET.SubElement(rej, "DETALICZNA").text = "Nie"
+        ET.SubElement(rej, "EKSPORT").text = "nie"
+        ET.SubElement(rej, "FINALNY").text = "Nie"
+        ET.SubElement(rej, "IDENTYFIKATOR_KSIEGOWY")
         ET.SubElement(rej, "TYP_PODMIOTU").text = "kontrahent"
         ET.SubElement(rej, "PODMIOT").text = k["akronim"]
+        ET.SubElement(rej, "PODMIOT_ID")
         ET.SubElement(rej, "NAZWA1").text = k["nazwa"]
         ET.SubElement(rej, "NIP_KRAJ").text = k["kod_kraju"]
         ET.SubElement(rej, "NIP").text = k["nip"]
@@ -257,12 +362,14 @@ def generuj_xml_optima(lista_danych: list[dict[str, Any]], plik_wyjsciowy: str, 
         ET.SubElement(rej, "NOTOWANIE_WALUTY_ILE").text = r["kurs"]
         ET.SubElement(rej, "NOTOWANIE_WALUTY_ZA_ILE").text = "1"
         ET.SubElement(rej, "DATA_KURSU").text = r["data_kursu"]
+        ET.SubElement(rej, "KURS_DO_KSIEGOWANIA").text = "Nie"
 
         if r["platnosc_vat_w_pln"]:
             ET.SubElement(rej, "PLATNOSC_VAT_W_PLN").text = "Tak"
 
         ET.SubElement(rej, "JPK_FA").text = "Tak"
         ET.SubElement(rej, "NR_KSEF").text = r["nr_ksef"]
+        ET.SubElement(rej, "KSEF_DATA_PRZYJECIA").text = data_wyst
 
         pozycje = ET.SubElement(rej, "POZYCJE")
         poz = ET.SubElement(pozycje, "POZYCJA")
@@ -273,49 +380,35 @@ def generuj_xml_optima(lista_danych: list[dict[str, Any]], plik_wyjsciowy: str, 
         ET.SubElement(poz, "VAT").text = r["vat"]
         ET.SubElement(poz, "NETTO_SYS").text = r["netto_sys"]
         ET.SubElement(poz, "VAT_SYS").text = r["vat_sys"]
+        ET.SubElement(poz, "NETTO_SYS2").text = r["netto_sys"]
+        ET.SubElement(poz, "VAT_SYS2").text = r["vat_sys"]
         ET.SubElement(poz, "RODZAJ_SPRZEDAZY" if typ_rejestru == "sprzedaz" else "RODZAJ_ZAKUPU").text = "usługi"
+        ET.SubElement(poz, "UWZ_W_PROPORCJI").text = "nie"
+        ET.SubElement(poz, "KOLUMNA_KPR").text = "Nie księgować"
+        ET.SubElement(poz, "KOLUMNA_RYCZALT").text = "Nie księgować"
 
         platnosci = ET.SubElement(rej, "PLATNOSCI")
-        if r["platnosc_vat_w_pln"]:
-            p1 = ET.SubElement(platnosci, "PLATNOSC")
-            ET.SubElement(p1, "TERMIN_PLAT").text = r["termin"]
-            ET.SubElement(p1, "FORMA_PLATNOSCI_PLAT").text = "przelew"
-            ET.SubElement(p1, "WALUTA_PLAT").text = r["waluta"]
-            ET.SubElement(p1, "KURS_WALUTY_PLAT").text = "NBP"
-            ET.SubElement(p1, "NOTOWANIE_WALUTY_ILE_PLAT").text = r["kurs"]
-            ET.SubElement(p1, "NOTOWANIE_WALUTY_ZA_ILE_PLAT").text = "1"
-            ET.SubElement(p1, "KWOTA_PLN_PLAT").text = r["netto_sys"]
-            ET.SubElement(p1, "KWOTA_PLAT").text = r["netto"]
-            ET.SubElement(p1, "KIERUNEK").text = kierunek_platnosci
-            ET.SubElement(p1, "PODLEGA_ROZLICZENIU").text = "Tak"
-            ET.SubElement(p1, "DATA_KURSU_PLAT").text = r["data_kursu"]
-            ET.SubElement(p1, "WALUTA_DOK").text = r["waluta"]
+        p = ET.SubElement(platnosci, "PLATNOSC")
+        ET.SubElement(p, "ID_ŹRÓDLA_PLAT")
+        ET.SubElement(p, "TERMIN_PLAT").text = termin_plat
+        ET.SubElement(p, "FORMA_PLATNOSCI_PLAT").text = "przelew"
+        ET.SubElement(p, "WALUTA_PLAT").text = r["waluta"] if r["waluta"] != "PLN" else ""
+        ET.SubElement(p, "KURS_WALUTY_PLAT").text = "NBP"
+        ET.SubElement(p, "NOTOWANIE_WALUTY_ILE_PLAT").text = r["kurs"]
+        ET.SubElement(p, "NOTOWANIE_WALUTY_ZA_ILE_PLAT").text = "1"
+        ET.SubElement(p, "KWOTA_PLN_PLAT").text = r["kwota_brutto_pln"]
+        ET.SubElement(p, "KWOTA_PLAT").text = r["kwota_brutto"]
+        ET.SubElement(p, "KIERUNEK").text = kierunek_platnosci
+        ET.SubElement(p, "PODLEGA_ROZLICZENIU").text = "Tak"
+        ET.SubElement(p, "KONTO")
+        ET.SubElement(p, "PLATNOSC_PODMIOT_RACGUNEK_NR")
+        ET.SubElement(p, "DATA_KURSU_PLAT").text = data_wyst
+        ET.SubElement(p, "WALUTA_DOK").text = r["waluta"] if r["waluta"] != "PLN" else ""
 
-            p2 = ET.SubElement(platnosci, "PLATNOSC")
-            ET.SubElement(p2, "TERMIN_PLAT").text = r["termin"]
-            ET.SubElement(p2, "FORMA_PLATNOSCI_PLAT").text = "przelew"
-            ET.SubElement(p2, "WALUTA_PLAT").text = ""
-            ET.SubElement(p2, "KURS_WALUTY_PLAT").text = "--"
-            ET.SubElement(p2, "NOTOWANIE_WALUTY_ILE_PLAT").text = "1"
-            ET.SubElement(p2, "NOTOWANIE_WALUTY_ZA_ILE_PLAT").text = "1"
-            ET.SubElement(p2, "KWOTA_PLN_PLAT").text = r["vat_sys"]
-            ET.SubElement(p2, "KWOTA_PLAT").text = r["vat_sys"]
-            ET.SubElement(p2, "KIERUNEK").text = kierunek_platnosci
-            ET.SubElement(p2, "PODLEGA_ROZLICZENIU").text = "Tak"
-            ET.SubElement(p2, "DATA_KURSU_PLAT").text = r["data_kursu"]
-            ET.SubElement(p2, "WALUTA_DOK").text = ""
-        else:
-            p = ET.SubElement(platnosci, "PLATNOSC")
-            ET.SubElement(p, "TERMIN_PLAT").text = r["termin"]
-            ET.SubElement(p, "FORMA_PLATNOSCI_PLAT").text = "przelew"
-            ET.SubElement(p, "WALUTA_PLAT").text = r["waluta"] if r["waluta"] != "PLN" else ""
-            ET.SubElement(p, "KWOTA_PLN_PLAT").text = r["kwota_brutto_pln"]
-            ET.SubElement(p, "KWOTA_PLAT").text = r["kwota_brutto"]
-            ET.SubElement(p, "KIERUNEK").text = kierunek_platnosci
-            ET.SubElement(p, "PODLEGA_ROZLICZENIU").text = "Tak"
+        ET.SubElement(rej, "KODY_JPK")
 
     drzewo = ET.ElementTree(root)
-    ET.indent(drzewo, space="  ")
+    ET.indent(drzewo, space="")
     drzewo.write(plik_wyjsciowy, encoding="windows-1250", xml_declaration=True)
 
 

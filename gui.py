@@ -16,8 +16,18 @@ from excel_exporter import eksportuj_liste_do_csv
 from okno_ustawien import OknoUstawien
 from optima_exporter import eksportuj_katalog_do_optimy
 
+
+def pobierz_sciezke(nazwa_pliku):
+    """Zwraca poprawną ścieżkę do zasobów zarówno w trybie developerskim, jak i po spakowaniu PyInstallerem."""
+    if getattr(sys, "frozen", False):
+        katalog_bazowy = os.path.dirname(sys.executable)
+    else:
+        katalog_bazowy = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(katalog_bazowy, nazwa_pliku)
+
+
 ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("motyw_windows.json")
+ctk.set_default_color_theme(pobierz_sciezke("motyw_windows.json"))
 
 
 def stworz_kalendarz(rodzic, default_date):

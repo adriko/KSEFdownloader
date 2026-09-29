@@ -146,12 +146,11 @@ def pobierz_paczke_faktur(
     nazwa_firmy,
     prefiks,
 ):
-    """Pobiera i odszyfrowuje paczki faktur, dzieląc zakres na okna <= 90 dni (limit KSeF: 100 dni)."""
-    # Dzielimy żądany zakres na okna do 90 dni, aby uniknąć błędu 21405
+    """Pobiera i odszyfrowuje paczki faktur z bezpiecznymi przerwami między oknami (30 dni)."""
     okna_czasowe = []
     kursor_od = data_od
     while kursor_od < data_do:
-        kursor_do = min(kursor_od + timedelta(days=90), data_do)
+        kursor_do = min(kursor_od + timedelta(days=30), data_do)
         okna_czasowe.append((kursor_od, kursor_do))
         kursor_od = kursor_do
 
@@ -173,7 +172,6 @@ def pobierz_paczke_faktur(
             f"{okno_od.strftime('%Y-%m-%d')} do {okno_do.strftime('%Y-%m-%d')}..."
         )
 
-        # 1. Unikalna para kluczy symetrycznych AES dla każdego okna
         aes_key = secrets.token_bytes(32)
         iv = secrets.token_bytes(16)
 
@@ -202,13 +200,14 @@ def pobierz_paczke_faktur(
             },
         }
 
-        # 2. Wysłanie zlecenia eksportu
+        # 2. Wysłanie zlecenia eksportu z pełną obsługą kodu 429 (Rate Limit)
         while True:
             if stop_event and stop_event.is_set():
                 return lacznie_wyodrebnionych
 
             resp = requests.post(url_export, headers=headers, json=payload, timeout=45)
             if resp.status_code == 429:
+                # Odczytaj czas z nagłówka lub daj bezpieczne domyślnie 60 sekund
                 retry = int(resp.headers.get("Retry-After", 60))
                 if not czekaj_z_odliczaniem(retry, stop_event, progress_callback, nazwa_firmy):
                     return lacznie_wyodrebnionych
@@ -232,7 +231,7 @@ def pobierz_paczke_faktur(
 
             r_stat = requests.get(url_status, headers=headers, timeout=30)
             if r_stat.status_code == 429:
-                retry = int(r_stat.headers.get("Retry-After", 10))
+                retry = int(r_stat.headers.get("Retry-After", 30))
                 if not czekaj_z_odliczaniem(retry, stop_event, progress_callback, nazwa_firmy):
                     return lacznie_wyodrebnionych
                 continue
@@ -290,7 +289,9 @@ def pobierz_paczke_faktur(
             if os.path.exists(sciezka_zip):
                 os.remove(sciezka_zip)
 
-        time.sleep(1.0)
+        # KLUCZOWE: 5 sekund przerwy między kolejnymi oknami czasowymi, 
+        # co chroni przed natychmiastowym ponownym banem 429 od KSeF.
+        time.sleep(5.0)
 
     print(f"Łącznie wyodrębniono {lacznie_wyodrebnionych} faktur XML dla [{prefiks}].")
     return lacznie_wyodrebnionych
@@ -387,9 +388,10 @@ def main(
     if wybrana_firma_nip == "WSZYSTKIE":
         firmy_do_przetworzenia = lista_firm
     else:
-        firmy_do_przetworzenia = [
+        firmy_do_przeniesienia = [
             f for f in lista_firm if str(f["nip"]).strip() == str(wybrana_firma_nip).strip()
         ]
+        firmy_do_przetworzenia = firmy_do_przeniesienia
 
     zadania = []
     if pobieraj_zakupowe:
@@ -456,7 +458,8 @@ def main(
                     prefiks=prefiks,
                 )
 
-            time.sleep(2.0)
+            # Przerwa między zmianą rejestru (np. zakup -> sprzedaż)
+            time.sleep(3.0)
 
         if przerwano:
             break
